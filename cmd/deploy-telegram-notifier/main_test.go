@@ -22,7 +22,11 @@ func testConfig(t *testing.T, serverURL string) config {
 }
 
 func imageJSON(runID, revision string) io.Reader {
-	return strings.NewReader(`[{"Config":{"Labels":{"io.github.deploy-notifier.repository":"owner/app","io.github.deploy-notifier.branch":"main","io.github.deploy-notifier.build-number":"265","io.github.deploy-notifier.run-id":"` + runID + `","io.github.deploy-notifier.pipeline-url":"https://github.com/owner/app/actions/runs/` + runID + `","io.github.deploy-notifier.commit":"fix: <health>","io.github.deploy-notifier.author":"Ada","org.opencontainers.image.revision":"` + revision + `"}}}]`)
+	return imageJSONFor("owner/app", "265", runID, revision)
+}
+
+func imageJSONFor(repository, build, runID, revision string) io.Reader {
+	return strings.NewReader(`[{"Config":{"Labels":{"io.github.deploy-notifier.repository":"` + repository + `","io.github.deploy-notifier.branch":"main","io.github.deploy-notifier.build-number":"` + build + `","io.github.deploy-notifier.run-id":"` + runID + `","io.github.deploy-notifier.pipeline-url":"https://github.com/owner/app/actions/runs/` + runID + `","io.github.deploy-notifier.commit":"fix: <health>","io.github.deploy-notifier.author":"Ada","org.opencontainers.image.revision":"` + revision + `"}}}]`)
 }
 
 func TestSuccessfulReleaseSendsOneAggregatedNotification(t *testing.T) {
@@ -308,5 +312,96 @@ func TestPriorSuccessfulRevisionIsReportedAsRollback(t *testing.T) {
 	deploy("rollback", "aaaaaaa111111")
 	if len(messages) != 3 || !strings.Contains(messages[2], "Rollback Succeeded") || !strings.Contains(messages[2], "From: bbbbbbb") || !strings.Contains(messages[2], "To: aaaaaaa") {
 		t.Fatalf("unexpected rollback messages: %#v", messages)
+	}
+}
+
+func recordingTelegram(t *testing.T) (*httptest.Server, *[]string) {
+	t.Helper()
+	var messages []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Text string `json:"text"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		messages = append(messages, payload.Text)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(server.Close)
+	return server, &messages
+}
+
+func TestNewerReleaseSupersedesPendingOnes(t *testing.T) {
+	telegram, messages := recordingTelegram(t)
+	health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer health.Close()
+	now := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	cfg := testConfig(t, telegram.URL)
+	started := []string{"--project", "orbital", "--service", "api", "--status", "started", "--stage", "pull", "--expected-services", "api,web"}
+	for index, build := range []string{"59", "62", "63"} {
+		cfg.Now = func() time.Time { return now.Add(time.Duration(index) * time.Minute) }
+		if err := runEvent(cfg, started, imageJSONFor("owner/app", build, "run-"+build, "rev"+build)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg.Now = func() time.Time { return now.Add(3 * time.Minute) }
+	for _, service := range []string{"api", "web"} {
+		if err := runEvent(cfg, []string{"--project", "orbital", "--service", service, "--status", "succeeded", "--stage", "healthcheck", "--expected-services", "api,web", "--health-url", health.URL}, imageJSONFor("owner/app", "63", "run-63", "rev63")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg.Now = func() time.Time { return now.Add(releaseTimeout + 5*time.Minute) }
+	if err := runSweep(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(*messages) != 1 || !strings.Contains((*messages)[0], "Deploy Succeeded") || !strings.Contains((*messages)[0], "Supersedes: #59, #62") {
+		t.Fatalf("unexpected messages: %#v", *messages)
+	}
+	st, err := loadState(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"orbital:run-59", "orbital:run-62"} {
+		if st.Releases[key].SupersededBy == "" || historyStatus(st.Releases[key]) != "superseded" {
+			t.Fatalf("%s is not superseded: %#v", key, st.Releases[key])
+		}
+	}
+	if err := runPending(cfg, []string{"--project", "orbital"}, imageJSONFor("owner/app", "62", "run-62", "rev62")); err == nil {
+		t.Fatal("a superseded release must not be pending")
+	}
+}
+
+func TestLateEventForOlderBuildIsSilenced(t *testing.T) {
+	telegram, messages := recordingTelegram(t)
+	cfg := testConfig(t, telegram.URL)
+	if err := runEvent(cfg, []string{"--project", "orbital", "--service", "api", "--status", "started", "--stage", "pull", "--expected-services", "api,web"}, imageJSONFor("owner/app", "63", "run-63", "rev63")); err != nil {
+		t.Fatal(err)
+	}
+	if err := runEvent(cfg, []string{"--project", "orbital", "--service", "web", "--status", "failed", "--stage", "healthcheck", "--expected-services", "api,web"}, imageJSONFor("owner/app", "62", "run-62", "rev62")); err != nil {
+		t.Fatal(err)
+	}
+	if len(*messages) != 0 {
+		t.Fatalf("unexpected messages: %#v", *messages)
+	}
+}
+
+func TestReleasesOfOtherRepositoriesAreNotSuperseded(t *testing.T) {
+	telegram, messages := recordingTelegram(t)
+	now := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	cfg := testConfig(t, telegram.URL)
+	cfg.Now = func() time.Time { return now }
+	started := []string{"--project", "orbital", "--service", "api", "--status", "started", "--stage", "pull", "--expected-services", "api,web"}
+	if err := runEvent(cfg, started, imageJSONFor("owner/api", "10", "run-api", "aaa")); err != nil {
+		t.Fatal(err)
+	}
+	if err := runEvent(cfg, started, imageJSONFor("owner/web", "20", "run-web", "bbb")); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Now = func() time.Time { return now.Add(delayThreshold + time.Second) }
+	if err := runSweep(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(*messages) != 2 {
+		t.Fatalf("delayed messages = %d, want 2: %#v", len(*messages), *messages)
 	}
 }

@@ -45,6 +45,7 @@ deploy-telegram-notifier test --scenario recovery --app-url https://example.com
 ```
 
 `event` accepts `started`, `succeeded`, and `failed`. A failure event may use `--previous-online` when the old container was kept running and `--reason` for a short, non-sensitive diagnostic. `sweep` reports a deployment delay after five minutes by default, then an incomplete release after ten minutes. Configure the first threshold with `DEPLOY_NOTIFIER_DELAY_THRESHOLD`.
+When several pushes land close together, a newer release of the same project and repository supersedes the older pending ones: they stay silent and the newer message lists them under `Supersedes`.
 `pending` is used by the updater to retry only releases that previously failed their final readiness check.
 `history` prints the release events kept locally for up to 30 days. It is intentionally a local operational history, not a database or central audit system.
 `test --scenario failure|recovery|delayed|rollback` sends synthetic Telegram events through the same state machine without touching Docker, migrations, or a real project. `rollback` sends the preceding two synthetic successful deploys as context, then the rollback result.
