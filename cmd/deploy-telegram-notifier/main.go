@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -86,6 +87,11 @@ type release struct {
 	Rollback          bool                    `json:"rollback"`
 	LastFailureStage  string                  `json:"lastFailureStage,omitempty"`
 	LastFailureAt     time.Time               `json:"lastFailureAt,omitempty"`
+	// SupersededBy is the key of a newer release of the same project and
+	// repository. A superseded release never sends further notifications:
+	// the newer one reports the final outcome instead.
+	SupersededBy string   `json:"supersededBy,omitempty"`
+	Supersedes   []string `json:"supersedes,omitempty"`
 }
 
 type state struct {
@@ -226,7 +232,7 @@ func runSweep(cfg config) error {
 	cleanup(st, now)
 	var notifications []notification
 	for key, rel := range st.Releases {
-		if rel.NotifiedSuccess {
+		if rel.NotifiedSuccess || rel.SupersededBy != "" {
 			continue
 		}
 		if now.Sub(rel.StartedAt) >= cfg.DelayThreshold && !rel.NotifiedDelayed {
@@ -305,7 +311,7 @@ func runPending(cfg config, args []string, input io.Reader) error {
 		return err
 	}
 	rel := st.Releases[*project+":"+releaseID]
-	if rel == nil || rel.NotifiedSuccess {
+	if rel == nil || rel.NotifiedSuccess || rel.SupersededBy != "" {
 		return fmt.Errorf("release is not pending")
 	}
 	return nil
@@ -411,7 +417,9 @@ func process(cfg config, ev event) error {
 	rel.Services[ev.Service] = serviceState{Status: ev.Status, Stage: ev.Stage, At: ev.At}
 
 	var notifications []notification
-	if ev.Status == "failed" {
+	if rel.SupersededBy != "" {
+		// A newer release already replaced this one: keep its history, stay silent.
+	} else if ev.Status == "failed" {
 		failureKey := ev.Service + ":" + ev.Stage
 		if !rel.NotifiedFailures[failureKey] {
 			notifications = append(notifications, notification{Kind: "failure", ReleaseKey: key, FailureKey: failureKey, Service: ev.Service, Stage: ev.Stage, Reason: ev.Reason, PreviousOK: ev.PreviousOnline})
@@ -460,8 +468,73 @@ func getRelease(st *state, ev event) (string, *release) {
 		rel.PreviousReleaseID = previous.ReleaseID
 		rel.Rollback = ev.Metadata.Revision != "" && ev.Metadata.Revision != previous.Metadata.Revision && hasSuccessfulRevision(st, ev.Project, ev.Metadata.Revision)
 	}
+	supersede(st, key, rel)
 	st.Releases[key] = rel
 	return key, rel
+}
+
+// supersede links a newly seen release to the other releases of the same
+// project and repository. Older releases still waiting for an outcome are
+// replaced by the new one, because the shared image tag already points past
+// them and they can never become fully healthy. A release that turns up
+// after a newer one (a late event) is itself marked as superseded.
+func supersede(st *state, key string, rel *release) {
+	if rel.Metadata.RunID == "" {
+		return
+	}
+	for otherKey, other := range st.Releases {
+		if other.Project != rel.Project || other.Metadata.RunID == "" || other.Metadata.Repository != rel.Metadata.Repository {
+			continue
+		}
+		if isNewer(other, rel) {
+			if rel.SupersededBy == "" {
+				rel.SupersededBy = otherKey
+			}
+			continue
+		}
+		if other.NotifiedSuccess || other.SupersededBy != "" {
+			continue
+		}
+		other.SupersededBy = key
+		rel.Supersedes = appendUnique(rel.Supersedes, other.Supersedes...)
+		rel.Supersedes = appendUnique(rel.Supersedes, buildLabel(other))
+	}
+	sort.Strings(rel.Supersedes)
+}
+
+// isNewer reports whether a was published after b. Build numbers of the same
+// repository are authoritative; without them the first time each release was
+// seen decides, and a tie favours the release seen last (b).
+func isNewer(a, b *release) bool {
+	aBuild, aErr := strconv.Atoi(a.Metadata.BuildNumber)
+	bBuild, bErr := strconv.Atoi(b.Metadata.BuildNumber)
+	if aErr == nil && bErr == nil && aBuild != bBuild {
+		return aBuild > bBuild
+	}
+	return a.StartedAt.After(b.StartedAt)
+}
+
+func buildLabel(rel *release) string {
+	if rel.Metadata.BuildNumber != "" {
+		return "#" + rel.Metadata.BuildNumber
+	}
+	return shortRevision(rel.Metadata.Revision)
+}
+
+func appendUnique(items []string, values ...string) []string {
+	for _, value := range values {
+		found := false
+		for _, item := range items {
+			if item == value {
+				found = true
+				break
+			}
+		}
+		if !found {
+			items = append(items, value)
+		}
+	}
+	return items
 }
 
 func latestSuccessful(st *state, project, skipKey string) *release {
@@ -508,6 +581,9 @@ func historyStatus(rel *release) string {
 			return "rollback"
 		}
 		return "succeeded"
+	}
+	if rel.SupersededBy != "" {
+		return "superseded"
 	}
 	if hasNotifiedFailure(rel) {
 		return "failed"
@@ -762,13 +838,17 @@ func waitingServices(rel *release) []string {
 
 func details(rel *release, _ string) string {
 	meta := rel.Metadata
+	superseded := ""
+	if len(rel.Supersedes) > 0 {
+		superseded = "\nSupersedes: " + html.EscapeString(strings.Join(rel.Supersedes, ", "))
+	}
 	return "Project: " + html.EscapeString(fallback(rel.Project, "Unknown")) +
 		"\nRepo: " + html.EscapeString(fallback(meta.Repository, "Unknown")) +
 		"\nBranch: " + html.EscapeString(fallback(meta.Branch, "Unknown")) +
 		"\nBuild: #" + html.EscapeString(fallback(meta.BuildNumber, "Unknown")) +
 		"\nCommit: " + html.EscapeString(truncate(fallback(meta.Commit, "Unavailable"), 240)) +
 		"\nAuthor: " + html.EscapeString(fallback(meta.Author, "Unknown")) +
-		"\nRevision: " + html.EscapeString(shortRevision(meta.Revision))
+		"\nRevision: " + html.EscapeString(shortRevision(meta.Revision)) + superseded
 }
 
 func fallback(value, alternative string) string {

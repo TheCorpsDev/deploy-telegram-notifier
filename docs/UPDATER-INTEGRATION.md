@@ -40,6 +40,7 @@ The project image workflow must add the OCI labels listed in the main README. Th
 - A deployment still incomplete after five minutes sends one delayed notification; after ten minutes it sends the existing incomplete-release failure. Set `DEPLOY_NOTIFIER_DELAY_THRESHOLD` to change the first threshold.
 - A successful notification is sent once all expected services for one run are healthy and the public health URL returns `200`. A release that had emitted a failure first is reported as recovered.
 - Republishing a revision that was already successfully online after a newer revision is reported as a rollback.
+- A newer release of the same project and repository supersedes the older ones still waiting for an outcome: the shared image tag already points past them, so they could never become fully healthy. Superseded releases send no delayed or failure messages, `pending` ignores them, and the newer release lists them in a `Supersedes: #59, #62` line. Build numbers decide which release is newer; a late event for an older build is recorded but stays silent. Releases of different repositories never supersede each other.
 - `history --project my-project` lists the local 30-day release history.
 - The existing updater invokes `pending` only after a deployment failure, allowing readiness recovery without turning the notifier into uptime monitoring.
 
